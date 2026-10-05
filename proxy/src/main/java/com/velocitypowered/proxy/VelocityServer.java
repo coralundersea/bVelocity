@@ -113,6 +113,9 @@ import org.checkerframework.checker.nullness.qual.EnsuresNonNull;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
+import top.notcoral.velocity.command.BvCommand;
+import top.notcoral.velocity.config.BrandMode;
+import top.notcoral.velocity.config.BvConfiguration;
 
 /**
  * Implementation of {@link ProxyServer}.
@@ -152,10 +155,17 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
       .create();
   private static final int PRE_SHUTDOWN_TIMEOUT =
             Integer.getInteger("velocity.pre-shutdown-timeout", 10);
+  // bVelocity: cap how long a reload waits for in-flight player evacuations. connectWithIndication
+  // does not time out on its own, so an unbounded latch.await() would hang the reload (and the
+  // console thread driving it) forever if a backend or event loop stalls. Mirrors the shutdown
+  // path's bounded playersTeardownFuture.get(10, SECONDS).
+  private static final int RELOAD_EVACUATE_TIMEOUT =
+            Integer.getInteger("velocity.reload-evacuate-timeout", 10);
 
   private final ConnectionManager cm;
   private final ProxyOptions options;
   private @MonotonicNonNull VelocityConfiguration configuration;
+  private @MonotonicNonNull BvConfiguration bvConfiguration;
   private @MonotonicNonNull KeyPair serverKeyPair;
   private final ServerMap servers;
   private final VelocityCommandManager commandManager;
@@ -197,6 +207,29 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
     return this.configuration;
   }
 
+  /**
+   * Returns the bVelocity-specific configuration loaded from {@code bvelocity.toml}.
+   *
+   * @return the bVelocity-specific configuration loaded from {@code bvelocity.toml}
+   */
+  public BvConfiguration getBvConfiguration() {
+    return this.bvConfiguration;
+  }
+
+  /**
+   * Returns the rendered custom F3 brand string to send to clients when the brand mode is
+   * {@code custom}, or {@code null} when upstream behavior ({@code "<backend> (<proxy>)"}) should
+   * apply. This is a thin convenience over {@link BvConfiguration#getBrand()} for the brand-rewrite
+   * call sites, which pass the result straight into
+   * {@link com.velocitypowered.proxy.protocol.util.PluginMessageUtil#rewriteMinecraftBrand}.
+   *
+   * @return the rendered custom brand string, or {@code null} for upstream behavior
+   */
+  public String getBrandCustomForRewrite() {
+    final BvConfiguration.Brand brand = this.bvConfiguration.getBrand();
+    return brand.getMode() == BrandMode.CUSTOM ? brand.getRenderedCustomBrand() : null;
+  }
+
   @Override
   public ProxyVersion getVersion() {
     Package pkg = VelocityServer.class.getPackage();
@@ -204,13 +237,13 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
     String implVersion;
     String implVendor;
     if (pkg != null) {
-      implName = MoreObjects.firstNonNull(pkg.getImplementationTitle(), "Velocity");
+      implName = MoreObjects.firstNonNull(pkg.getImplementationTitle(), "bVelocity");
       implVersion = MoreObjects.firstNonNull(pkg.getImplementationVersion(), "<unknown>");
-      implVendor = MoreObjects.firstNonNull(pkg.getImplementationVendor(), "Velocity Contributors");
+      implVendor = MoreObjects.firstNonNull(pkg.getImplementationVendor(), "NotCoral");
     } else {
-      implName = "Velocity";
+      implName = "bVelocity";
       implVersion = "<unknown>";
-      implVendor = "Velocity Contributors";
+      implVendor = "NotCoral";
     }
 
     return new ProxyVersion(implName, implVendor, implVersion);
@@ -271,6 +304,14 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
             .plugin(VelocityVirtualPlugin.INSTANCE)
             .build(),
         callbackCommand
+    );
+    final BrigadierCommand bvelocityCommand = BvCommand.create(this);
+    commandManager.register(
+        commandManager.metaBuilder(bvelocityCommand)
+            .plugin(VelocityVirtualPlugin.INSTANCE)
+            .aliases("bv")
+            .build(),
+        bvelocityCommand
     );
     final BrigadierCommand serverCommand = ServerCommand.create(this);
     commandManager.register(
@@ -407,7 +448,7 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
       configuration = VelocityConfiguration.read(configPath);
 
       if (!configuration.validate()) {
-        logger.error("Your configuration is invalid. Velocity will not start up until the errors "
+        logger.error("Your configuration is invalid. bVelocity will not start up until the errors "
             + "are resolved.");
         LogManager.shutdown();
         System.exit(1);
@@ -416,6 +457,25 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
       commandManager.setAnnounceProxyCommands(configuration.isAnnounceProxyCommands());
     } catch (Exception e) {
       logger.error("Unable to read/load/save your velocity.toml. The server will shut down.", e);
+      LogManager.shutdown();
+      System.exit(1);
+    }
+
+    try {
+      Path bvConfigPath = Path.of("bvelocity.toml");
+      bvConfiguration = BvConfiguration.read(bvConfigPath);
+
+      if (!bvConfiguration.validate()) {
+        logger.error("Your bvelocity.toml is invalid. bVelocity will not start up until the errors "
+            + "are resolved.");
+        LogManager.shutdown();
+        System.exit(1);
+      }
+      // Wire the freshly loaded BvConfiguration onto the VelocityConfiguration so the ProxyConfig
+      // compression getters (used by AuthSessionHandler / MinecraftConnection / BvCommand) resolve.
+      configuration.setBvConfiguration(bvConfiguration);
+    } catch (Exception e) {
+      logger.error("Unable to read/load/save your bvelocity.toml. The server will shut down.", e);
       LogManager.shutdown();
       System.exit(1);
     }
@@ -488,6 +548,19 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
       return false;
     }
 
+    // Reload the bVelocity-specific configuration too. Compression-threshold / -level only affect
+    // newly established connections, so a reload does not disturb existing players; the
+    // optimization knobs apply to freshly initialized pipelines.
+    Path bvConfigPath = Path.of("bvelocity.toml");
+    BvConfiguration newBvConfiguration = BvConfiguration.read(bvConfigPath);
+    if (!newBvConfiguration.validate()) {
+      return false;
+    }
+    this.bvConfiguration = newBvConfiguration;
+    // Keep the ProxyConfig compression getters in sync — VelocityConfiguration.read() already
+    // attached its own BvConfiguration, but a reload must point at the freshly loaded one.
+    newConfiguration.setBvConfiguration(newBvConfiguration);
+
     // Re-register servers. If a server is being replaced or removed, make sure to note what
     // players need to move back to a fallback server.
     Collection<ConnectedPlayer> evacuate = new ArrayList<>();
@@ -553,7 +626,10 @@ public class VelocityServer implements ProxyServer, ForwardingAudience {
         }
       }
       try {
-        latch.await();
+        if (!latch.await(RELOAD_EVACUATE_TIMEOUT, TimeUnit.SECONDS)) {
+          logger.warn("Reload took over {} seconds evacuating players; continuing.",
+              RELOAD_EVACUATE_TIMEOUT);
+        }
       } catch (InterruptedException e) {
         logger.error("Interrupted whilst moving players", e);
         Thread.currentThread().interrupt();
