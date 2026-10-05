@@ -51,7 +51,15 @@ class VelocityCompressorTest {
   @Test
   @EnabledOnOs({LINUX})
   void sanityCheckNative() {
-    assertThrows(IllegalArgumentException.class, () -> Natives.compress.get().create(-42));
+    // bVelocity normalizes compression levels into the range each backend supports (see
+    // CompressionLevelUtil) instead of rejecting them, so out-of-range values must clamp rather
+    // than fail compressor creation.
+    assertDoesNotThrow(() -> {
+      VelocityCompressor below = Natives.compress.get().create(-42);
+      below.close();
+      VelocityCompressor above = Natives.compress.get().create(512);
+      above.close();
+    });
   }
 
   @Test
@@ -94,6 +102,18 @@ class VelocityCompressorTest {
       VelocityCompressor compressor = JavaVelocityCompressor.FACTORY.create(12);
       compressor.close();
     });
+  }
+
+  @Test
+  void compressionLevelsAreNormalizedToBackendRange() {
+    assertEquals(1, CompressionLevelUtil.forJava(-42));
+    assertEquals(CompressionLevelUtil.JAVA_MAX_LEVEL, CompressionLevelUtil.forJava(512));
+    assertEquals(1, CompressionLevelUtil.forLibdeflate(-42));
+    assertEquals(CompressionLevelUtil.LIBDEFLATE_MAX_LEVEL, CompressionLevelUtil.forLibdeflate(512));
+    assertEquals(CompressionLevelUtil.AGGRESSIVE_JAVA_DEFAULT,
+        CompressionLevelUtil.forJava(Deflater.DEFAULT_COMPRESSION));
+    assertEquals(CompressionLevelUtil.AGGRESSIVE_NATIVE_DEFAULT,
+        CompressionLevelUtil.forLibdeflate(Deflater.DEFAULT_COMPRESSION));
   }
 
   private static final int BOMB_ACTUAL_SIZE = 1 << 20;
